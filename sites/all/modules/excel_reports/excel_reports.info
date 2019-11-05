@@ -1,0 +1,14 @@
+name = Excel Reports
+description = "Plugin to export views data into Excel files and create complex spreadsheets programmatically"
+core = 7.x
+php = 5.3
+package = Reports
+dependencies[] = cool
+dependencies[] = libraries
+dependencies[] = views
+; Information added by Drupal.org packaging script on 2014-12-03
+version = "7.x-1.x-dev"
+core = "7.x"
+project = "excel_reports"
+datestamp = "1417645691"
+

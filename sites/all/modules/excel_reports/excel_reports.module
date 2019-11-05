@@ -1,0 +1,223 @@
+<?php
+
+define('excel_reports_HEADER', 'header');
+define('excel_reports_BODY', 'body');
+define('excel_reports_FINISHED', 'finished');
+define('excel_reports_INDEX_TABLE_PREFIX', 'excel_reports_index_');
+
+/**
+ * Implements hook_init().
+ */
+function excel_reports_init() {
+  // We have to include our theme preprocessors here until:
+  // http://drupal.org/node/1096770 is fixed.
+  module_load_include('inc', 'excel_reports', 'theme/excel_reports.theme');
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function excel_reports_views_api() {
+  return array(
+    'api' => 2,
+  );
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function excel_reports_theme() {
+  // Make sure that views picks up the preprocess functions.
+  module_load_include('inc', 'excel_reports', 'excel_reports.theme');
+  $themes = array();
+  $themes['excel_reports_feed_icon'] = array(
+    'pattern' => 'excel_reports_feed_icon__',
+    'variables' => array(
+      'image_path' => NULL,
+      'url' => NULL,
+      'query' => '',
+      'text' => '',
+    ),
+    'file' => 'excel_reports.theme.inc',
+  );
+  $themes['excel_reports_complete_page'] = array(
+    'variables' => array(
+      'file' => '',
+      'errors' => array(),
+      'return_url' => '',
+    ),
+    'file' => 'excel_reports.theme.inc',
+  );
+  $themes['excel_reports_message'] = array(
+    'variables' => array(
+      'message' => '',
+      'type' => 'info',
+    ),
+    'file' => 'excel_reports.theme.inc',
+  );
+  return $themes;
+}
+
+/**
+ * Implementation of hook_cron().
+ */
+function excel_reports_cron() {
+  excel_reports_garbage_collect();
+}
+
+/**
+ * Removes any temporary index tables that have been left
+ * behind. This is caused by batch processes which are
+ * started but never finished.
+ *
+ * Removes all trace of exports from the database that
+ * were created more than $expires seconds ago
+ *
+ * @param $expires
+ *   Seconds ago. Defaults to that given in the settings.
+ * @param $chunk
+ *   The number of tables to test for and delete.
+ *   Defaults to that given in the settings. Pass -1
+ *   for this setting to remove any restriction and to
+ *   garbage collect all exports.
+ */
+function excel_reports_garbage_collect($expires = NULL, $chunk = NULL) {
+  if (lock_acquire('excel_reports_gc')) {
+    if (!isset($expires)) {
+      $expires = variable_get('excel_reports_gc_expires', 604800); // one week
+    }
+    if (!isset($chunk)) {
+      $chunk = variable_get('excel_reports_gc_chunk', 30);
+    }
+
+    if ($chunk == -1) {
+      $result = db_query("SELECT eid FROM {excel_reports} WHERE time_stamp <= :timestamp ORDER BY time_stamp ASC", array(':timestamp' => REQUEST_TIME - $expires));
+    }
+    else {
+      $result = db_query_range("SELECT eid FROM {excel_reports} WHERE time_stamp <= :timestamp ORDER BY time_stamp ASC", 0, $chunk, array(':timestamp' => REQUEST_TIME - $expires));
+    }
+
+    $eids_to_clear = array();
+    foreach ($result as $row) {
+      $eids_to_clear[] = $row->eid;
+    }
+
+    // We do two things to exports we want to garbage collect
+    // 1. Delete the index table for it, if it is still around
+    // 2. Delete the row from the exports table
+    // 3. Delete the view from the object_cache
+    if (count($eids_to_clear)) {
+      foreach ($eids_to_clear as $eid) {
+        // 1. Delete index table, if it is still around for some reason
+        $table = excel_reports_INDEX_TABLE_PREFIX . $eid;
+        if (db_table_exists($table)) {
+          db_drop_table($table);
+        }
+      }
+
+      // 2. Delete the entries in the exports table.
+      db_delete('excel_reports')
+          ->condition('eid', $eids_to_clear, 'IN')
+          ->execute();
+
+      // 3. Clear the cached views
+      \Drupal\excel_reports\ExcelReportViewObjectCache::clear($eids_to_clear);
+    }
+
+    lock_release('excel_reports_gc');
+  }
+}
+
+/**
+ * Batch API callback.
+ * Handles all batching operations by executing the appropriate view.
+ */
+function _excel_reports_batch_process($export_id, $display_id, $exposed_input, &$context) {
+  // Don't show the admin menu on batch page, some people don't like it.
+  if (module_exists('admin_menu')) {
+    module_invoke('admin_menu', 'suppress');
+  }
+
+  // Fetch the view in question from our cache
+  $view = \Drupal\excel_reports\ExcelReportViewObjectCache::retrieve($export_id);
+  $view->set_display($display_id);
+  if (!empty($exposed_input)) {
+    $view->set_exposed_input($exposed_input);
+  }
+  // Inform the data_export display which export it corresponds to and execute
+  if (!isset($view->display_handler->batched_execution_state)) {
+    $view->display_handler->batched_execution_state = new stdClass();
+  }
+  $view->display_handler->batched_execution_state->eid = $export_id;
+  $view->display_handler->excel_reports_cached_view_loaded = TRUE;
+  $view->execute_display($display_id);
+
+  // Update batch api progress information
+  $sandbox = $view->display_handler->batched_execution_state->sandbox;
+  $context['finished'] = $sandbox['finished'];
+  $context['message'] = $sandbox['message'];
+
+  \Drupal\excel_reports\ExcelReportViewObjectCache::store($export_id, $view);
+}
+
+/**
+ * Drupal seems to not yet recognize the classes while calling hook_menu
+ */
+function excel_reports_menu() {
+  $items = array();
+  $classes = \Drupal\cool\Loader::mapSubclassesAvailable('ExcelReports', '\Drupal\excel_reports\ExcelReport');
+  foreach ($classes as $class_name) {
+    $items[$class_name::$path] = array(
+      'title' => $class_name::$title,
+      'page callback' => 'excel_reports_default_page_callback',
+      'page arguments' => array($class_name),
+      'access arguments' => array('access excel reports')
+    );
+  }
+  return $items;
+}
+
+/**
+ * Default function to call the page callback from reports classes
+ * @param string $class_name
+ */
+function excel_reports_default_page_callback($class_name) {
+  try {
+    $class_name::pageCallback();
+  }
+  catch (\Exception $e) {
+    watchdog('error', '<pre>' . print_r($e, TRUE) . '</pre>');
+  }
+}
+
+function excel_reports_permission() {
+  return array(
+    'access excel reports' => array(
+      'title' => t('Access excel reports'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function excel_reports_libraries_info() {
+  return array(
+    'PHPExcel' => array(
+      'name' => 'PHPExcel',
+      'vendor url' => 'http://phpexcel.codeplex.com/',
+      'download url' => 'https://github.com/PHPOffice/PHPExcel',
+      'version arguments' => array(
+        'file' => 'changelog.txt',
+        'pattern' => "/@version\s+([0-9\.]+)/",
+        'lines' => 25,
+      ),
+      'path' => 'Classes',
+      'files' => array(
+        'php' => array(
+          'PHPExcel.php',
+        ),
+      ),
+    ),
+  );
+}
